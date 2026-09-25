@@ -15,8 +15,14 @@ const otpSchema=new Schema({
         type:Date,
         required:true
     },
+    attempts:{
+        type:Number,
+        default:0
+    },
+    lockUntil:{
+        type:Date,
+        default:null
+    }
 })
-
-
 
 module.exports=mongoose.model("OTP",otpSchema)

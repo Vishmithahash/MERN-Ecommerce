@@ -136,15 +136,13 @@ exports.googleCallback = async (req, res) => {
 
 exports.signup=async(req,res)=>{
     try {
-        if (req.body.googleId) {
-            delete req.body.googleId;
+        const { name, email, password } = req.body;
+
+        if (!name || !email || !password) {
+            return res.status(400).json({ message: "Name, email, and password are required" });
         }
 
-        if (!req.body.password) {
-            return res.status(400).json({ message: "Password is required" });
-        }
-
-        const existingUser=await User.findOne({email:req.body.email})
+        const existingUser=await User.findOne({email})
         
         // if user already exists
         if(existingUser){
@@ -152,11 +150,16 @@ exports.signup=async(req,res)=>{
         }
 
         // hashing the password
-        const hashedPassword=await bcrypt.hash(req.body.password,10)
-        req.body.password=hashedPassword
+        const hashedPassword=await bcrypt.hash(password,10)
 
-        // creating new user
-        const createdUser=new User(req.body)
+        // creating new user with explicit fields and forced defaults
+        const createdUser=new User({
+            name,
+            email,
+            password: hashedPassword,
+            isAdmin: false,
+            isVerified: false
+        })
         await createdUser.save()
 
         // getting secure user info
@@ -231,6 +234,11 @@ exports.login=async(req,res)=>{
 
 exports.verifyOtp=async(req,res)=>{
     try {
+        // Enforce exact 6-digit number string
+        if(!req.body.otp || typeof req.body.otp !== 'string' || !/^\d{6}$/.test(req.body.otp)){
+            return res.status(400).json({message:"OTP must be an exact 6-digit number string"})
+        }
+
         // checks if user id is existing in the user collection
         const isValidUserId=await User.findById(req.body.userId)
 
@@ -247,22 +255,39 @@ exports.verifyOtp=async(req,res)=>{
             return res.status(404).json({message:'Otp not found'})
         }
 
-        // checks if the otp is expired, if yes then deletes the otp and returns response accordinly
+        // checks if temporary lockout is active
+        if(isOtpExisting.lockUntil && isOtpExisting.lockUntil > new Date()){
+            return res.status(400).json({message:"Account is temporarily locked due to too many failed attempts. Try again later."})
+        }
+
+        // checks if the otp is expired
         if(isOtpExisting.expiresAt < new Date()){
-            await Otp.findByIdAndDelete(isOtpExisting._id)
             return res.status(400).json({message:"Otp has been expired"})
         }
         
-        // checks if otp is there and matches the hash value then updates the user verified status to true and returns the updated user
-        if(isOtpExisting && (await bcrypt.compare(req.body.otp,isOtpExisting.otp))){
+        // checks if otp matches the hash value
+        if(await bcrypt.compare(req.body.otp,isOtpExisting.otp)){
             await Otp.findByIdAndDelete(isOtpExisting._id)
             const verifiedUser=await User.findByIdAndUpdate(isValidUserId._id,{isVerified:true},{new:true})
             return res.status(200).json(sanitizeUser(verifiedUser))
         }
 
-        // in default case if none of the conidtion matches, then return this response
-        return res.status(400).json({message:'Otp is invalid or expired'})
-
+        // Failed attempt logic: increment attempts and set 10-minute lock after 5 failed attempts
+        const updatedAttempts = (isOtpExisting.attempts || 0) + 1;
+        if(updatedAttempts >= 5){
+            const lockTime = new Date(Date.now() + 10 * 60 * 1000);
+            await Otp.findOneAndUpdate(
+                { _id: isOtpExisting._id },
+                { $set: { attempts: updatedAttempts, lockUntil: lockTime } }
+            );
+            return res.status(400).json({message:"Too many failed attempts. Account is temporarily locked for 10 minutes."})
+        } else {
+            await Otp.findOneAndUpdate(
+                { _id: isOtpExisting._id },
+                { $set: { attempts: updatedAttempts } }
+            );
+            return res.status(400).json({message:'Otp is invalid or expired'})
+        }
 
     } catch (error) {
         console.log(error);
@@ -272,20 +297,38 @@ exports.verifyOtp=async(req,res)=>{
 
 exports.resendOtp=async(req,res)=>{
     try {
-
         const existingUser=await User.findById(req.body.user)
 
         if(!existingUser){
             return res.status(404).json({"message":"User not found"})
         }
 
-        await Otp.deleteMany({user:existingUser._id})
+        const existingOtp=await Otp.findOne({user:existingUser._id})
+
+        // Prevent resend if account is temporarily locked
+        if(existingOtp && existingOtp.lockUntil && existingOtp.lockUntil > new Date()){
+            return res.status(400).json({message:"Account is temporarily locked due to too many failed attempts. Try again later."})
+        }
 
         const otp=generateOTP()
         const hashedOtp=await bcrypt.hash(otp,10)
+        const expiresAt = new Date(Date.now() + parseInt(process.env.OTP_EXPIRATION_TIME || 120000));
 
-        const newOtp=new Otp({user:req.body.user,otp:hashedOtp,expiresAt:Date.now()+parseInt(process.env.OTP_EXPIRATION_TIME)})
-        await newOtp.save()
+        if(existingOtp){
+            // Update code and expiry, but preserve attempts and lockUntil state
+            existingOtp.otp = hashedOtp;
+            existingOtp.expiresAt = expiresAt;
+            await existingOtp.save();
+        } else {
+            const newOtp=new Otp({
+                user:req.body.user,
+                otp:hashedOtp,
+                expiresAt:expiresAt,
+                attempts: 0,
+                lockUntil: null
+            })
+            await newOtp.save()
+        }
 
         await sendMail(existingUser.email,`OTP Verification for Your MERN-AUTH-REDUX-TOOLKIT Account`,`Your One-Time Password (OTP) for account verification is: <b>${otp}</b>.</br>Do not share this OTP with anyone for security reasons`)
 
