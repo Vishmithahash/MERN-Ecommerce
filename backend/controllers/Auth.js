@@ -1,5 +1,7 @@
 const User = require("../models/User");
 const bcrypt=require('bcryptjs');
+const crypto = require('crypto');
+const { OAuth2Client } = require('google-auth-library');
 const { sendMail } = require("../utils/Emails");
 const { generateOTP } = require("../utils/GenerateOtp");
 const Otp = require("../models/OTP");
@@ -7,8 +9,141 @@ const { sanitizeUser } = require("../utils/SanitizeUser");
 const { generateToken } = require("../utils/GenerateToken");
 const PasswordResetToken = require("../models/PasswordResetToken");
 
+const getOAuth2Client = () => {
+    return new OAuth2Client(
+        process.env.GOOGLE_CLIENT_ID,
+        process.env.GOOGLE_CLIENT_SECRET,
+        process.env.GOOGLE_CALLBACK_URL
+    );
+};
+
+exports.googleAuth = async (req, res) => {
+    try {
+        if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET || !process.env.GOOGLE_CALLBACK_URL) {
+            return res.status(500).json({ message: "Google authentication environment variables are missing." });
+        }
+
+        const state = crypto.randomBytes(32).toString("hex");
+        res.cookie("oauth_state", state, {
+            httpOnly: true,
+            maxAge: 10 * 60 * 1000,
+            sameSite: process.env.PRODUCTION === 'true' ? 'None' : 'Lax',
+            secure: process.env.PRODUCTION === 'true' ? true : false
+        });
+
+        const client = getOAuth2Client();
+        const authUrl = client.generateAuthUrl({
+            access_type: "online",
+            scope: ["openid", "email", "profile"],
+            state: state
+        });
+
+        return res.redirect(authUrl);
+    } catch (error) {
+        console.error("Error initiating Google auth:", error.message);
+        return res.status(500).json({ message: "Failed to initiate Google authentication" });
+    }
+};
+
+exports.googleCallback = async (req, res) => {
+    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
+    try {
+        const { code, state, error: consentError } = req.query;
+        const storedState = req.cookies ? req.cookies.oauth_state : null;
+
+        res.clearCookie("oauth_state");
+
+        if (consentError || !code) {
+            return res.redirect(frontendUrl);
+        }
+
+        if (!state || !storedState || state !== storedState) {
+            return res.status(400).json({ message: "Invalid or expired state parameter." });
+        }
+
+        const client = getOAuth2Client();
+        const { tokens } = await client.getToken(code);
+
+        if (!tokens || !tokens.id_token) {
+            return res.status(400).json({ message: "Failed to retrieve Google ID token." });
+        }
+
+        const ticket = await client.verifyIdToken({
+            idToken: tokens.id_token,
+            audience: process.env.GOOGLE_CLIENT_ID
+        });
+
+        const payload = ticket.getPayload();
+        if (!payload) {
+            return res.status(400).json({ message: "Invalid ID token payload." });
+        }
+
+        const validIssuers = ["accounts.google.com", "https://accounts.google.com"];
+        if (!validIssuers.includes(payload.iss)) {
+            return res.status(400).json({ message: "Invalid token issuer." });
+        }
+
+        if (!payload.email_verified) {
+            return res.status(400).json({ message: "Google email is not verified." });
+        }
+
+        const { sub, email, name } = payload;
+        if (!sub || !email) {
+            return res.status(400).json({ message: "Missing required identity fields from Google." });
+        }
+
+        // Check if returning user by googleId
+        let user = await User.findOne({ googleId: sub });
+
+        if (!user) {
+            // Check if account with email already exists without linked googleId
+            const existingUserByEmail = await User.findOne({ email });
+            if (existingUserByEmail) {
+                return res.status(409).json({ message: "An account with this email already exists." });
+            }
+
+            // Create new Google user
+            user = new User({
+                name: name || email.split("@")[0],
+                email: email,
+                googleId: sub,
+                isVerified: true,
+                isAdmin: false
+            });
+            await user.save();
+        }
+
+        // Issue login JWT token cookie
+        const secureInfo = sanitizeUser(user);
+        const token = generateToken(secureInfo);
+
+        const expirationDays = parseInt(process.env.COOKIE_EXPIRATION_DAYS) || 30;
+        const maxAgeMs = expirationDays * 24 * 60 * 60 * 1000;
+
+        res.cookie('token', token, {
+            sameSite: process.env.PRODUCTION === 'true' ? 'None' : 'Lax',
+            maxAge: maxAgeMs,
+            httpOnly: true,
+            secure: process.env.PRODUCTION === 'true' ? true : false
+        });
+
+        return res.redirect(frontendUrl);
+    } catch (error) {
+        console.error("Google Callback Error:", error.message);
+        return res.redirect(frontendUrl);
+    }
+};
+
 exports.signup=async(req,res)=>{
     try {
+        if (req.body.googleId) {
+            delete req.body.googleId;
+        }
+
+        if (!req.body.password) {
+            return res.status(400).json({ message: "Password is required" });
+        }
+
         const existingUser=await User.findOne({email:req.body.email})
         
         // if user already exists
@@ -30,10 +165,13 @@ exports.signup=async(req,res)=>{
         // generating jwt token
         const token=generateToken(secureInfo)
 
+        const expirationDays = parseInt(process.env.COOKIE_EXPIRATION_DAYS) || 30;
+        const maxAgeMs = expirationDays * 24 * 60 * 60 * 1000;
+
         // sending jwt token in the response cookies
         res.cookie('token',token,{
             sameSite:process.env.PRODUCTION==='true'?"None":'Lax',
-            maxAge:new Date(Date.now() + (parseInt(process.env.COOKIE_EXPIRATION_DAYS * 24 * 60 * 60 * 1000))),
+            maxAge:maxAgeMs,
             httpOnly:true,
             secure:process.env.PRODUCTION==='true'?true:false
         })
@@ -48,8 +186,18 @@ exports.signup=async(req,res)=>{
 
 exports.login=async(req,res)=>{
     try {
+        if (!req.body.password || !req.body.email) {
+            res.clearCookie('token');
+            return res.status(400).json({message:"Invalid Credentails"})
+        }
+
         // checking if user exists or not
         const existingUser=await User.findOne({email:req.body.email})
+
+        if (!existingUser || !existingUser.password) {
+            res.clearCookie('token');
+            return res.status(404).json({message:"Invalid Credentails"})
+        }
 
         // if exists and password matches the hash
         if(existingUser && (await bcrypt.compare(req.body.password,existingUser.password))){
@@ -60,10 +208,13 @@ exports.login=async(req,res)=>{
             // generating jwt token
             const token=generateToken(secureInfo)
 
+            const expirationDays = parseInt(process.env.COOKIE_EXPIRATION_DAYS) || 30;
+            const maxAgeMs = expirationDays * 24 * 60 * 60 * 1000;
+
             // sending jwt token in the response cookies
             res.cookie('token',token,{
                 sameSite:process.env.PRODUCTION==='true'?"None":'Lax',
-                maxAge:new Date(Date.now() + (parseInt(process.env.COOKIE_EXPIRATION_DAYS * 24 * 60 * 60 * 1000))),
+                maxAge:maxAgeMs,
                 httpOnly:true,
                 secure:process.env.PRODUCTION==='true'?true:false
             })

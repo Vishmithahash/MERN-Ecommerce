@@ -6,6 +6,8 @@ const { verifyToken } = require('../middleware/VerifyToken')
 router
     .post("/signup",authController.signup)
     .post('/login',authController.login)
+    .get("/google",authController.googleAuth)
+    .get("/google/callback",authController.googleCallback)
     .post("/verify-otp",authController.verifyOtp)
     .post("/resend-otp",authController.resendOtp)
     .post("/forgot-password",authController.forgotPassword)

@@ -47,6 +47,14 @@ server.get("/",(req,res)=>{
     res.status(200).json({message:'running'})
 })
 
-server.listen(8000,()=>{
-    console.log('server [STARTED] ~ http://localhost:8000');
+const PORT = process.env.PORT || 5000
+
+const requiredEnvVars = ['MONGO_URI', 'SECRET_KEY', 'GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_CALLBACK_URL', 'ORIGIN', 'FRONTEND_URL'];
+const missingVars = requiredEnvVars.filter(v => !process.env[v] || process.env[v].includes('REPLACE_WITH_'));
+if (missingVars.length > 0) {
+    console.warn(`[Startup Warning] Missing or unconfigured environment variables: ${missingVars.join(', ')}`);
+}
+
+server.listen(PORT, () => {
+    console.log(`server [STARTED] ~ http://localhost:${PORT}`);
 })
