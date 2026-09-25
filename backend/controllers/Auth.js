@@ -1,6 +1,7 @@
 const User = require("../models/User");
 const bcrypt=require('bcryptjs');
 const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
 const { OAuth2Client } = require('google-auth-library');
 const { sendMail } = require("../utils/Emails");
 const { generateOTP } = require("../utils/GenerateOtp");
@@ -272,21 +273,31 @@ exports.verifyOtp=async(req,res)=>{
             return res.status(200).json(sanitizeUser(verifiedUser))
         }
 
-        // Failed attempt logic: increment attempts and set 10-minute lock after 5 failed attempts
-        const updatedAttempts = (isOtpExisting.attempts || 0) + 1;
-        if(updatedAttempts >= 5){
-            const lockTime = new Date(Date.now() + 10 * 60 * 1000);
-            await Otp.findOneAndUpdate(
-                { _id: isOtpExisting._id },
-                { $set: { attempts: updatedAttempts, lockUntil: lockTime } }
-            );
-            return res.status(400).json({message:"Too many failed attempts. Account is temporarily locked for 10 minutes."})
+        // Atomic concurrency-safe failed attempt update pipeline in MongoDB
+        const lockTime = new Date(Date.now() + 10 * 60 * 1000);
+        const updatedOtpDoc = await Otp.findOneAndUpdate(
+            { _id: isOtpExisting._id },
+            [
+                {
+                    $set: {
+                        attempts: { $add: [{ $ifNull: ["$attempts", 0] }, 1] },
+                        lockUntil: {
+                            $cond: {
+                                if: { $gte: [{ $add: [{ $ifNull: ["$attempts", 0] }, 1] }, 5] },
+                                then: lockTime,
+                                else: "$lockUntil"
+                            }
+                        }
+                    }
+                }
+            ],
+            { new: true }
+        );
+
+        if (updatedOtpDoc && updatedOtpDoc.attempts >= 5) {
+            return res.status(400).json({ message: "Too many failed attempts. Account is temporarily locked for 10 minutes." });
         } else {
-            await Otp.findOneAndUpdate(
-                { _id: isOtpExisting._id },
-                { $set: { attempts: updatedAttempts } }
-            );
-            return res.status(400).json({message:'Otp is invalid or expired'})
+            return res.status(400).json({ message: 'Otp is invalid or expired' });
         }
 
     } catch (error) {
@@ -384,6 +395,21 @@ exports.forgotPassword=async(req,res)=>{
 
 exports.resetPassword=async(req,res)=>{
     try {
+        if (!req.body.token) {
+            return res.status(404).json({ message: "Reset Link is Not Valid" });
+        }
+
+        // Verify JWT signature, allowed algorithm HS256, expiry, and reset-password purpose
+        let decodedToken;
+        try {
+            decodedToken = jwt.verify(req.body.token, process.env.SECRET_KEY, { algorithms: ['HS256'] });
+        } catch (jwtErr) {
+            return res.status(404).json({ message: "Reset Link is Not Valid" });
+        }
+
+        if (!decodedToken || decodedToken.purpose !== 'reset-password') {
+            return res.status(404).json({ message: "Reset Link is Not Valid" });
+        }
 
         // checks if user exists or not
         const isExistingUser=await User.findById(req.body.userId)
