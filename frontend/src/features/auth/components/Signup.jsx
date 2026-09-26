@@ -1,4 +1,5 @@
-import {FormHelperText, Stack, TextField, Typography,Box, useTheme, useMediaQuery} from '@mui/material'
+import {Button, FormHelperText, Stack, TextField, Typography,Box, useTheme, useMediaQuery} from '@mui/material'
+import GoogleIcon from '@mui/icons-material/Google'
 import React, { useEffect } from 'react'
 import Lottie from 'lottie-react'
 import { Link, useNavigate } from 'react-router-dom'
@@ -20,6 +21,12 @@ export const Signup = () => {
   const theme=useTheme()
   const is900=useMediaQuery(theme.breakpoints.down(900))
   const is480=useMediaQuery(theme.breakpoints.down(480))
+
+  const handleGoogleAuth = () => {
+    const baseUrl = process.env.REACT_APP_BASE_URL || 'http://localhost:5000/';
+    const targetUrl = baseUrl.endsWith('/') ? `${baseUrl}auth/google` : `${baseUrl}/auth/google`;
+    window.location.href = targetUrl;
+  };
 
   // handles user redirection
   useEffect(()=>{
@@ -108,6 +115,10 @@ export const Signup = () => {
 
                     <motion.div whileHover={{scale:1.020}} whileTap={{scale:1}}>
                       <LoadingButton sx={{height:'2.5rem'}} fullWidth loading={status==='pending'} type='submit' variant='contained'>Signup</LoadingButton>
+                    </motion.div>
+
+                    <motion.div whileHover={{scale:1.020}} whileTap={{scale:1}}>
+                      <Button type='button' fullWidth variant='outlined' onClick={handleGoogleAuth} startIcon={<GoogleIcon />} sx={{height:'2.5rem', textTransform:'none', fontWeight:600}}>Continue with Google</Button>
                     </motion.div>
 
                     <Stack flexDirection={'row'} justifyContent={'space-between'} alignItems={'center'} flexWrap={'wrap-reverse'}>

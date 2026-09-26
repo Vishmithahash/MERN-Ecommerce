@@ -88,30 +88,20 @@ export const OtpVerfication = () => {
             
             <Typography mt={4} variant='h5' fontWeight={500}>Verify Your Email Address</Typography>
 
-            {
-                resendOtpStatus==='fullfilled'?(
-                    <Stack width={'100%'} rowGap={'1rem'} component={'form'} noValidate onSubmit={handleSubmit(handleVerifyOtp)}>
-                        <Stack rowGap={'1rem'}> 
-                            <Stack>
-                                <Typography  color={'GrayText'}>Enter the 6 digit OTP sent on</Typography>
-                                <Typography fontWeight={'600'} color={'GrayText'}>{loggedInUser?.email}</Typography>
-                            </Stack>
-                            <Stack>
-                                <TextField {...register("otp",{required:"OTP is required",pattern:{value:/^\d{6}$/,message:"Please enter a 6 digit OTP"}})} fullWidth type='text' inputProps={{ inputMode: 'numeric', pattern: '[0-9]*', maxLength: 6 }} />
-                                {errors?.otp && <FormHelperText sx={{color:"red"}}>{errors.otp.message}</FormHelperText>}
-                            </Stack>
-                       </Stack>
-                        <LoadingButton loading={otpVerificationStatus==='pending'}  type='submit' fullWidth variant='contained'>Verify</LoadingButton>
+            <Stack width={'100%'} rowGap={'1rem'} component={'form'} noValidate onSubmit={handleSubmit(handleVerifyOtp)}>
+                <Stack rowGap={'1rem'}> 
+                    <Stack>
+                        <Typography color={'GrayText'}>Enter the 6 digit OTP sent to</Typography>
+                        <Typography fontWeight={'600'} color={'GrayText'}>{loggedInUser?.email}</Typography>
                     </Stack>
-                ):
-                <>
-                <Stack>
-                    <Typography color={'GrayText'}>We will send you a OTP on</Typography>
-                    <Typography fontWeight={'600'} color={'GrayText'}>{loggedInUser?.email}</Typography>
+                    <Stack>
+                        <TextField {...register("otp",{required:"OTP is required",pattern:{value:/^\d{6}$/,message:"Please enter a 6 digit OTP"}})} fullWidth type='text' inputProps={{ inputMode: 'numeric', pattern: '[0-9]*', maxLength: 6 }} placeholder="Enter 6-digit OTP" />
+                        {errors?.otp && <FormHelperText sx={{color:"red"}}>{errors.otp.message}</FormHelperText>}
+                    </Stack>
                 </Stack>
-                <LoadingButton onClick={handleSendOtp} loading={resendOtpStatus==='pending'} fullWidth variant='contained'>Get OTP</LoadingButton>
-                </>
-             }
+                <LoadingButton loading={otpVerificationStatus==='pending'} type='submit' fullWidth variant='contained'>Verify</LoadingButton>
+                <LoadingButton onClick={handleSendOtp} loading={resendOtpStatus==='pending'} fullWidth variant='outlined' type='button'>Resend OTP</LoadingButton>
+            </Stack>
 
         </Stack>
     </Stack>

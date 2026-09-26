@@ -235,13 +235,14 @@ exports.login=async(req,res)=>{
 
 exports.verifyOtp=async(req,res)=>{
     try {
+        const { userId, otp } = req.body;
         // Enforce exact 6-digit number string
-        if(!req.body.otp || typeof req.body.otp !== 'string' || !/^\d{6}$/.test(req.body.otp)){
+        if(!otp || typeof otp !== 'string' || !/^\d{6}$/.test(otp)){
             return res.status(400).json({message:"OTP must be an exact 6-digit number string"})
         }
 
         // checks if user id is existing in the user collection
-        const isValidUserId=await User.findById(req.body.userId)
+        const isValidUserId=await User.findById(userId)
 
         // if user id does not exists then returns a 404 response
         if(!isValidUserId){
@@ -256,36 +257,86 @@ exports.verifyOtp=async(req,res)=>{
             return res.status(404).json({message:'Otp not found'})
         }
 
+        const now = new Date();
+
         // checks if temporary lockout is active
-        if(isOtpExisting.lockUntil && isOtpExisting.lockUntil > new Date()){
+        if(isOtpExisting.lockUntil && isOtpExisting.lockUntil > now){
             return res.status(400).json({message:"Account is temporarily locked due to too many failed attempts. Try again later."})
         }
 
         // checks if the otp is expired
-        if(isOtpExisting.expiresAt < new Date()){
+        if(isOtpExisting.expiresAt <= now){
             return res.status(400).json({message:"Otp has been expired"})
         }
         
         // checks if otp matches the hash value
-        if(await bcrypt.compare(req.body.otp,isOtpExisting.otp)){
-            await Otp.findByIdAndDelete(isOtpExisting._id)
+        if(await bcrypt.compare(otp, isOtpExisting.otp)){
+            // Conditional atomic delete: verify that delete succeeded before marking user verified
+            const deletedOtpDoc = await Otp.findOneAndDelete({
+                _id: isOtpExisting._id,
+                expiresAt: { $gt: now },
+                $or: [
+                    { lockUntil: null },
+                    { lockUntil: { $lte: now } }
+                ]
+            });
+
+            if (!deletedOtpDoc) {
+                return res.status(400).json({ message: "Otp is invalid or expired" });
+            }
+
             const verifiedUser=await User.findByIdAndUpdate(isValidUserId._id,{isVerified:true},{new:true})
             return res.status(200).json(sanitizeUser(verifiedUser))
         }
 
         // Atomic concurrency-safe failed attempt update pipeline in MongoDB
-        const lockTime = new Date(Date.now() + 10 * 60 * 1000);
+        const lockDurationMs = 10 * 60 * 1000;
         const updatedOtpDoc = await Otp.findOneAndUpdate(
-            { _id: isOtpExisting._id },
+            {
+                _id: isOtpExisting._id,
+                $or: [
+                    { lockUntil: null },
+                    { lockUntil: { $lte: now } }
+                ]
+            },
             [
                 {
                     $set: {
-                        attempts: { $add: [{ $ifNull: ["$attempts", 0] }, 1] },
-                        lockUntil: {
+                        attempts: {
                             $cond: {
-                                if: { $gte: [{ $add: [{ $ifNull: ["$attempts", 0] }, 1] }, 5] },
-                                then: lockTime,
-                                else: "$lockUntil"
+                                if: {
+                                    $and: [
+                                        { $ne: ["$lockUntil", null] },
+                                        { $lte: ["$lockUntil", now] }
+                                    ]
+                                },
+                                then: 1,
+                                else: { $add: [{ $ifNull: ["$attempts", 0] }, 1] }
+                            }
+                        },
+                        lockUntil: {
+                            $let: {
+                                vars: {
+                                    nextAttempts: {
+                                        $cond: {
+                                            if: {
+                                                $and: [
+                                                    { $ne: ["$lockUntil", null] },
+                                                    { $lte: ["$lockUntil", now] }
+                                                ]
+                                            },
+                                            then: 1,
+                                            else: { $add: [{ $ifNull: ["$attempts", 0] }, 1] }
+                                        }
+                                    }
+                                },
+                                in: {
+                                    $cond: {
+                                        if: { $gte: ["$$nextAttempts", 5] },
+                                        then: new Date(now.getTime() + lockDurationMs),
+                                        else: null
+                                    }
+                                }
                             }
                         }
                     }
@@ -294,7 +345,11 @@ exports.verifyOtp=async(req,res)=>{
             { new: true }
         );
 
-        if (updatedOtpDoc && updatedOtpDoc.attempts >= 5) {
+        if (!updatedOtpDoc) {
+            return res.status(400).json({ message: "Account is temporarily locked due to too many failed attempts. Try again later." });
+        }
+
+        if (updatedOtpDoc.lockUntil && updatedOtpDoc.lockUntil > now) {
             return res.status(400).json({ message: "Too many failed attempts. Account is temporarily locked for 10 minutes." });
         } else {
             return res.status(400).json({ message: 'Otp is invalid or expired' });
@@ -314,32 +369,33 @@ exports.resendOtp=async(req,res)=>{
             return res.status(404).json({"message":"User not found"})
         }
 
+        const now = new Date();
         const existingOtp=await Otp.findOne({user:existingUser._id})
 
         // Prevent resend if account is temporarily locked
-        if(existingOtp && existingOtp.lockUntil && existingOtp.lockUntil > new Date()){
+        if(existingOtp && existingOtp.lockUntil && existingOtp.lockUntil > now){
             return res.status(400).json({message:"Account is temporarily locked due to too many failed attempts. Try again later."})
         }
 
         const otp=generateOTP()
         const hashedOtp=await bcrypt.hash(otp,10)
-        const expiresAt = new Date(Date.now() + parseInt(process.env.OTP_EXPIRATION_TIME || 120000));
+        const expiresAt = new Date(now.getTime() + parseInt(process.env.OTP_EXPIRATION_TIME || 120000));
 
-        if(existingOtp){
-            // Update code and expiry, but preserve attempts and lockUntil state
-            existingOtp.otp = hashedOtp;
-            existingOtp.expiresAt = expiresAt;
-            await existingOtp.save();
-        } else {
-            const newOtp=new Otp({
-                user:req.body.user,
-                otp:hashedOtp,
-                expiresAt:expiresAt,
-                attempts: 0,
-                lockUntil: null
-            })
-            await newOtp.save()
-        }
+        // Concurrency-safe atomic upsert to prevent multiple active OTP records per user
+        await Otp.findOneAndUpdate(
+            { user: existingUser._id },
+            {
+                $set: {
+                    otp: hashedOtp,
+                    expiresAt: expiresAt
+                },
+                $setOnInsert: {
+                    attempts: 0,
+                    lockUntil: null
+                }
+            },
+            { upsert: true, new: true }
+        );
 
         await sendMail(existingUser.email,`OTP Verification for Your MERN-AUTH-REDUX-TOOLKIT Account`,`Your One-Time Password (OTP) for account verification is: <b>${otp}</b>.</br>Do not share this OTP with anyone for security reasons`)
 
@@ -395,56 +451,59 @@ exports.forgotPassword=async(req,res)=>{
 
 exports.resetPassword=async(req,res)=>{
     try {
-        if (!req.body.token) {
+        const { userId, token, password } = req.body;
+        if (!token || !userId || !password) {
             return res.status(404).json({ message: "Reset Link is Not Valid" });
         }
 
-        // Verify JWT signature, allowed algorithm HS256, expiry, and reset-password purpose
+        // Verify JWT signature, allowed algorithm HS256, expiry, reset-password purpose, and matching userId claim
         let decodedToken;
         try {
-            decodedToken = jwt.verify(req.body.token, process.env.SECRET_KEY, { algorithms: ['HS256'] });
+            decodedToken = jwt.verify(token, process.env.SECRET_KEY, { algorithms: ['HS256'] });
         } catch (jwtErr) {
             return res.status(404).json({ message: "Reset Link is Not Valid" });
         }
 
-        if (!decodedToken || decodedToken.purpose !== 'reset-password') {
+        if (!decodedToken || decodedToken.purpose !== 'reset-password' || String(decodedToken._id) !== String(userId)) {
             return res.status(404).json({ message: "Reset Link is Not Valid" });
         }
 
         // checks if user exists or not
-        const isExistingUser=await User.findById(req.body.userId)
-
-        // if user does not exists then returns a 404 response
+        const isExistingUser=await User.findById(userId)
         if(!isExistingUser){
             return res.status(404).json({message:"User does not exists"})
         }
 
         // fetches the resetPassword token by the userId
         const isResetTokenExisting=await PasswordResetToken.findOne({user:isExistingUser._id})
-
-        // If token does not exists for that userid, then returns a 404 response
         if(!isResetTokenExisting){
             return res.status(404).json({message:"Reset Link is Not Valid"})
         }
 
-        // if the token has expired then deletes the token, and send response accordingly
-        if(isResetTokenExisting.expiresAt < new Date()){
+        // if the token has expired then deletes the token
+        if(isResetTokenExisting.expiresAt <= new Date()){
             await PasswordResetToken.findByIdAndDelete(isResetTokenExisting._id)
             return res.status(404).json({message:"Reset Link has been expired"})
         }
 
-        // if token exists and is not expired and token matches the hash, then resets the user password and deletes the token
-        if(isResetTokenExisting && isResetTokenExisting.expiresAt>new Date() && (await bcrypt.compare(req.body.token,isResetTokenExisting.token))){
+        // if token exists and matches the hash
+        if(await bcrypt.compare(token, isResetTokenExisting.token)){
+            // Conditional atomic delete: consume the matching, unexpired reset record
+            const deletedResetToken = await PasswordResetToken.findOneAndDelete({
+                _id: isResetTokenExisting._id,
+                expiresAt: { $gt: new Date() }
+            });
 
-            // deleting the password reset token
-            await PasswordResetToken.findByIdAndDelete(isResetTokenExisting._id)
+            if (!deletedResetToken) {
+                return res.status(404).json({ message: "Reset Link is Not Valid" });
+            }
 
-            // resets the password after hashing it
-            await User.findByIdAndUpdate(isExistingUser._id,{password:await bcrypt.hash(req.body.password,10)})
+            // Resets the password after hashing it
+            await User.findByIdAndUpdate(isExistingUser._id,{password:await bcrypt.hash(password,10)})
             return res.status(200).json({message:"Password Updated Successfuly"})
         }
 
-        return res.status(404).json({message:"Reset Link has been expired"})
+        return res.status(404).json({message:"Reset Link is Not Valid"})
 
     } catch (error) {
         console.log(error);
