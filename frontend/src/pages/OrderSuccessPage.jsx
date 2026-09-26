@@ -37,6 +37,7 @@ export const OrderSuccessPage = () => {
             <Stack mt={2} textAlign={'center'} justifyContent={'center'} alignItems={'center'} rowGap={1}>
                 <Typography variant='h6' fontWeight={400}>Hey {userDetails?.name}</Typography>
                 <Typography variant='h5' >Your Order #{currentOrder?._id} is confirmed</Typography>
+                <Typography variant='h6'>Confirmed total: ${currentOrder?.total}</Typography>
                 <Typography variant='body2' color='text.secondary'>Thankyou for shopping with us❤️</Typography>
             </Stack>
 

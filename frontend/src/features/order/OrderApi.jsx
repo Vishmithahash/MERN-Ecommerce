@@ -30,7 +30,7 @@ export const getAllOrders=async()=>{
 
 export const updateOrderById=async(update)=>{
     try {
-        const res=await axiosi.patch(`/orders/${update._id}`,update)
+        const res=await axiosi.patch(`/orders/${update._id}`,{status:update.status})
         return res.data
     } catch (error) {
         throw error.response.data

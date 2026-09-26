@@ -10,7 +10,6 @@ import { Link, useNavigate } from 'react-router-dom'
 import { createOrderAsync, selectCurrentOrder, selectOrderStatus } from '../../order/OrderSlice'
 import { resetCartByUserIdAsync, selectCartItems } from '../../cart/CartSlice'
 import ArrowBackIcon from '@mui/icons-material/ArrowBack';
-import { SHIPPING, TAXES } from '../../../constants'
 import {motion} from 'framer-motion'
 
 
@@ -19,7 +18,7 @@ export const Checkout = () => {
     const status=''
     const addresses=useSelector(selectAddresses)
     const [selectedAddress,setSelectedAddress]=useState(addresses[0])
-    const [selectedPaymentMethod,setSelectedPaymentMethod]=useState('cash')
+    const [selectedPaymentMethod,setSelectedPaymentMethod]=useState('COD')
     const { register, handleSubmit, watch, reset,formState: { errors }} = useForm()
     const dispatch=useDispatch()
     const loggedInUser=useSelector(selectLoggedInUser)
@@ -28,7 +27,6 @@ export const Checkout = () => {
     const cartItems=useSelector(selectCartItems)
     const orderStatus=useSelector(selectOrderStatus)
     const currentOrder=useSelector(selectCurrentOrder)
-    const orderTotal=cartItems.reduce((acc,item)=>(item.product.price*item.quantity)+acc,0)
     const theme=useTheme()
     const is900=useMediaQuery(theme.breakpoints.down(900))
     const is480=useMediaQuery(theme.breakpoints.down(480))
@@ -55,7 +53,8 @@ export const Checkout = () => {
     }
 
     const handleCreateOrder=()=>{
-        const order={user:loggedInUser._id,item:cartItems,address:selectedAddress,paymentMode:selectedPaymentMethod,total:orderTotal+SHIPPING+TAXES}
+        const item=cartItems.map(({product,quantity})=>({product:product._id,quantity}))
+        const order={user:loggedInUser._id,item,address:selectedAddress,paymentMode:selectedPaymentMethod}
         dispatch(createOrderAsync(order))
     }
 
