@@ -1,11 +1,30 @@
 const Review=require("../models/Review")
 
+const REVIEWER_PUBLIC_FIELDS='_id name'
+
+const toPublicReview=(review)=>{
+    if(!review){
+        return review
+    }
+
+    const publicReview=typeof review.toObject==='function'?review.toObject():{...review}
+
+    if(publicReview.user && typeof publicReview.user==='object' && publicReview.user.name!==undefined){
+        publicReview.user={
+            _id:publicReview.user._id,
+            name:publicReview.user.name
+        }
+    }
+
+    return publicReview
+}
+
 exports.create=async(req,res)=>{
     try {
-        console.log(req.body);
-        const created=await new Review(req.body).populate({path:'user',select:"-password"})
+        const created=new Review(req.body)
         await created.save()
-        res.status(201).json(created)
+        await created.populate({path:'user',select:REVIEWER_PUBLIC_FIELDS})
+        res.status(201).json(toPublicReview(created))
     } catch (error) {
         console.log(error);
         return res.status(500).json({message:'Error posting review, please trying again later'})
@@ -27,10 +46,10 @@ exports.getByProductId=async(req,res)=>{
         }
 
         const totalDocs=await Review.find({product:id}).countDocuments().exec()
-        const result=await Review.find({product:id}).skip(skip).limit(limit).populate('user').exec()
+        const result=await Review.find({product:id}).skip(skip).limit(limit).populate({path:'user',select:REVIEWER_PUBLIC_FIELDS}).exec()
 
         res.set("X-total-Count",totalDocs)
-        res.status(200).json(result)
+        res.status(200).json(result.map(toPublicReview))
 
     } catch (error) {
         console.log(error);
@@ -41,8 +60,8 @@ exports.getByProductId=async(req,res)=>{
 exports.updateById=async(req,res)=>{
     try {
         const {id}=req.params
-        const updated=await Review.findByIdAndUpdate(id,req.body,{new:true}).populate('user')
-        res.status(200).json(updated)
+        const updated=await Review.findByIdAndUpdate(id,req.body,{new:true}).populate({path:'user',select:REVIEWER_PUBLIC_FIELDS})
+        res.status(200).json(toPublicReview(updated))
     } catch (error) {
         console.log(error);
         res.status(500).json({message:'Error updating review, please try again later'})
