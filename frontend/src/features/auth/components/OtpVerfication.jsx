@@ -99,8 +99,8 @@ export const OtpVerfication = () => {
                         {errors?.otp && <FormHelperText sx={{color:"red"}}>{errors.otp.message}</FormHelperText>}
                     </Stack>
                 </Stack>
-                <LoadingButton loading={otpVerificationStatus==='pending'} type='submit' fullWidth variant='contained'>Verify</LoadingButton>
-                <LoadingButton onClick={handleSendOtp} loading={resendOtpStatus==='pending'} fullWidth variant='outlined' type='button'>Resend OTP</LoadingButton>
+                <LoadingButton loading={otpVerificationStatus==='pending'} disabled={otpVerificationStatus==='pending' || resendOtpStatus==='pending'} type='submit' fullWidth variant='contained'>Verify</LoadingButton>
+                <LoadingButton onClick={handleSendOtp} loading={resendOtpStatus==='pending'} disabled={resendOtpStatus==='pending' || otpVerificationStatus==='pending'} fullWidth variant='outlined' type='button'>Resend OTP</LoadingButton>
             </Stack>
 
         </Stack>
