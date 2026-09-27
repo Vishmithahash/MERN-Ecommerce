@@ -1,5 +1,8 @@
 const User = require("../models/User");
 const bcrypt=require('bcryptjs');
+const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
+const { OAuth2Client } = require('google-auth-library');
 const { sendMail } = require("../utils/Emails");
 const { generateOTP } = require("../utils/GenerateOtp");
 const Otp = require("../models/OTP");
@@ -7,9 +10,140 @@ const { sanitizeUser } = require("../utils/SanitizeUser");
 const { generateToken } = require("../utils/GenerateToken");
 const PasswordResetToken = require("../models/PasswordResetToken");
 
+const getOAuth2Client = () => {
+    return new OAuth2Client(
+        process.env.GOOGLE_CLIENT_ID,
+        process.env.GOOGLE_CLIENT_SECRET,
+        process.env.GOOGLE_CALLBACK_URL
+    );
+};
+
+exports.googleAuth = async (req, res) => {
+    try {
+        if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET || !process.env.GOOGLE_CALLBACK_URL) {
+            return res.status(500).json({ message: "Google authentication environment variables are missing." });
+        }
+
+        const state = crypto.randomBytes(32).toString("hex");
+        res.cookie("oauth_state", state, {
+            httpOnly: true,
+            maxAge: 10 * 60 * 1000,
+            sameSite: process.env.PRODUCTION === 'true' ? 'None' : 'Lax',
+            secure: process.env.PRODUCTION === 'true' ? true : false
+        });
+
+        const client = getOAuth2Client();
+        const authUrl = client.generateAuthUrl({
+            access_type: "online",
+            scope: ["openid", "email", "profile"],
+            state: state
+        });
+
+        return res.redirect(authUrl);
+    } catch (error) {
+        console.error("Error initiating Google auth:", error.message);
+        return res.status(500).json({ message: "Failed to initiate Google authentication" });
+    }
+};
+
+exports.googleCallback = async (req, res) => {
+    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
+    try {
+        const { code, state, error: consentError } = req.query;
+        const storedState = req.cookies ? req.cookies.oauth_state : null;
+
+        res.clearCookie("oauth_state");
+
+        if (consentError || !code) {
+            return res.redirect(frontendUrl);
+        }
+
+        if (!state || !storedState || state !== storedState) {
+            return res.status(400).json({ message: "Invalid or expired state parameter." });
+        }
+
+        const client = getOAuth2Client();
+        const { tokens } = await client.getToken(code);
+
+        if (!tokens || !tokens.id_token) {
+            return res.status(400).json({ message: "Failed to retrieve Google ID token." });
+        }
+
+        const ticket = await client.verifyIdToken({
+            idToken: tokens.id_token,
+            audience: process.env.GOOGLE_CLIENT_ID
+        });
+
+        const payload = ticket.getPayload();
+        if (!payload) {
+            return res.status(400).json({ message: "Invalid ID token payload." });
+        }
+
+        const validIssuers = ["accounts.google.com", "https://accounts.google.com"];
+        if (!validIssuers.includes(payload.iss)) {
+            return res.status(400).json({ message: "Invalid token issuer." });
+        }
+
+        if (!payload.email_verified) {
+            return res.status(400).json({ message: "Google email is not verified." });
+        }
+
+        const { sub, email, name } = payload;
+        if (!sub || !email) {
+            return res.status(400).json({ message: "Missing required identity fields from Google." });
+        }
+
+        // Check if returning user by googleId
+        let user = await User.findOne({ googleId: sub });
+
+        if (!user) {
+            // Check if account with email already exists without linked googleId
+            const existingUserByEmail = await User.findOne({ email });
+            if (existingUserByEmail) {
+                return res.status(409).json({ message: "An account with this email already exists." });
+            }
+
+            // Create new Google user
+            user = new User({
+                name: name || email.split("@")[0],
+                email: email,
+                googleId: sub,
+                isVerified: true,
+                isAdmin: false
+            });
+            await user.save();
+        }
+
+        // Issue login JWT token cookie
+        const secureInfo = sanitizeUser(user);
+        const token = generateToken(secureInfo);
+
+        const expirationDays = parseInt(process.env.COOKIE_EXPIRATION_DAYS) || 30;
+        const maxAgeMs = expirationDays * 24 * 60 * 60 * 1000;
+
+        res.cookie('token', token, {
+            sameSite: process.env.PRODUCTION === 'true' ? 'None' : 'Lax',
+            maxAge: maxAgeMs,
+            httpOnly: true,
+            secure: process.env.PRODUCTION === 'true' ? true : false
+        });
+
+        return res.redirect(frontendUrl);
+    } catch (error) {
+        console.error("Google Callback Error:", error.message);
+        return res.redirect(frontendUrl);
+    }
+};
+
 exports.signup=async(req,res)=>{
     try {
-        const existingUser=await User.findOne({email:req.body.email})
+        const { name, email, password } = req.body;
+
+        if (!name || !email || !password) {
+            return res.status(400).json({ message: "Name, email, and password are required" });
+        }
+
+        const existingUser=await User.findOne({email})
         
         // if user already exists
         if(existingUser){
@@ -17,12 +151,42 @@ exports.signup=async(req,res)=>{
         }
 
         // hashing the password
-        const hashedPassword=await bcrypt.hash(req.body.password,10)
-        req.body.password=hashedPassword
+        const hashedPassword=await bcrypt.hash(password,10)
 
-        // creating new user
-        const createdUser=new User(req.body)
+        // creating new user with explicit fields and forced defaults
+        const createdUser=new User({
+            name,
+            email,
+            password: hashedPassword,
+            isAdmin: false,
+            isVerified: false
+        })
         await createdUser.save()
+
+        // Generate initial OTP automatically for local signup
+        const initialOtp = generateOTP();
+        const initialHashedOtp = await bcrypt.hash(initialOtp, 10);
+        const otpExpiresAt = new Date(Date.now() + parseInt(process.env.OTP_EXPIRATION_TIME || 120000));
+
+        await Otp.findOneAndUpdate(
+            { user: createdUser._id },
+            {
+                $set: {
+                    otp: initialHashedOtp,
+                    expiresAt: otpExpiresAt,
+                    attempts: 0,
+                    lockUntil: null
+                }
+            },
+            { upsert: true, new: true }
+        );
+
+        // Attempt email delivery; if delivery fails, account remains unverified and user can use resend path
+        try {
+            await sendMail(createdUser.email, `OTP Verification for Your MERN-AUTH-REDUX-TOOLKIT Account`, `Your One-Time Password (OTP) for account verification is: <b>${initialOtp}</b>.</br>Do not share this OTP with anyone for security reasons`);
+        } catch (emailErr) {
+            console.error("[Signup Email Warning] Could not send initial OTP email:", emailErr.message);
+        }
 
         // getting secure user info
         const secureInfo=sanitizeUser(createdUser)
@@ -30,10 +194,13 @@ exports.signup=async(req,res)=>{
         // generating jwt token
         const token=generateToken(secureInfo)
 
+        const expirationDays = parseInt(process.env.COOKIE_EXPIRATION_DAYS) || 30;
+        const maxAgeMs = expirationDays * 24 * 60 * 60 * 1000;
+
         // sending jwt token in the response cookies
         res.cookie('token',token,{
             sameSite:process.env.PRODUCTION==='true'?"None":'Lax',
-            maxAge:new Date(Date.now() + (parseInt(process.env.COOKIE_EXPIRATION_DAYS * 24 * 60 * 60 * 1000))),
+            maxAge:maxAgeMs,
             httpOnly:true,
             secure:process.env.PRODUCTION==='true'?true:false
         })
@@ -48,8 +215,18 @@ exports.signup=async(req,res)=>{
 
 exports.login=async(req,res)=>{
     try {
+        if (!req.body.password || !req.body.email) {
+            res.clearCookie('token');
+            return res.status(400).json({message:"Invalid Credentails"})
+        }
+
         // checking if user exists or not
         const existingUser=await User.findOne({email:req.body.email})
+
+        if (!existingUser || !existingUser.password) {
+            res.clearCookie('token');
+            return res.status(404).json({message:"Invalid Credentails"})
+        }
 
         // if exists and password matches the hash
         if(existingUser && (await bcrypt.compare(req.body.password,existingUser.password))){
@@ -60,10 +237,13 @@ exports.login=async(req,res)=>{
             // generating jwt token
             const token=generateToken(secureInfo)
 
+            const expirationDays = parseInt(process.env.COOKIE_EXPIRATION_DAYS) || 30;
+            const maxAgeMs = expirationDays * 24 * 60 * 60 * 1000;
+
             // sending jwt token in the response cookies
             res.cookie('token',token,{
                 sameSite:process.env.PRODUCTION==='true'?"None":'Lax',
-                maxAge:new Date(Date.now() + (parseInt(process.env.COOKIE_EXPIRATION_DAYS * 24 * 60 * 60 * 1000))),
+                maxAge:maxAgeMs,
                 httpOnly:true,
                 secure:process.env.PRODUCTION==='true'?true:false
             })
@@ -80,8 +260,14 @@ exports.login=async(req,res)=>{
 
 exports.verifyOtp=async(req,res)=>{
     try {
+        const { userId, otp } = req.body;
+        // Enforce exact 6-digit number string
+        if(!otp || typeof otp !== 'string' || !/^\d{6}$/.test(otp)){
+            return res.status(400).json({message:"OTP must be an exact 6-digit number string"})
+        }
+
         // checks if user id is existing in the user collection
-        const isValidUserId=await User.findById(req.body.userId)
+        const isValidUserId=await User.findById(userId)
 
         // if user id does not exists then returns a 404 response
         if(!isValidUserId){
@@ -96,22 +282,110 @@ exports.verifyOtp=async(req,res)=>{
             return res.status(404).json({message:'Otp not found'})
         }
 
-        // checks if the otp is expired, if yes then deletes the otp and returns response accordinly
-        if(isOtpExisting.expiresAt < new Date()){
-            await Otp.findByIdAndDelete(isOtpExisting._id)
+        const now = new Date();
+
+        // checks if temporary lockout is active
+        if(isOtpExisting.lockUntil && isOtpExisting.lockUntil > now){
+            return res.status(400).json({message:"Account is temporarily locked due to too many failed attempts. Try again later."})
+        }
+
+        // checks if the otp is expired
+        if(isOtpExisting.expiresAt <= now){
             return res.status(400).json({message:"Otp has been expired"})
         }
         
-        // checks if otp is there and matches the hash value then updates the user verified status to true and returns the updated user
-        if(isOtpExisting && (await bcrypt.compare(req.body.otp,isOtpExisting.otp))){
-            await Otp.findByIdAndDelete(isOtpExisting._id)
+        // checks if otp matches the hash value
+        if(await bcrypt.compare(otp, isOtpExisting.otp)){
+            // Conditional atomic delete: verify that delete succeeded before marking user verified, bound to exact checked hash
+            const deletedOtpDoc = await Otp.findOneAndDelete({
+                _id: isOtpExisting._id,
+                otp: isOtpExisting.otp,
+                expiresAt: { $gt: now },
+                $or: [
+                    { lockUntil: null },
+                    { lockUntil: { $lte: now } }
+                ]
+            });
+
+            if (!deletedOtpDoc) {
+                return res.status(400).json({ message: "Otp is invalid or expired" });
+            }
+
             const verifiedUser=await User.findByIdAndUpdate(isValidUserId._id,{isVerified:true},{new:true})
             return res.status(200).json(sanitizeUser(verifiedUser))
         }
 
-        // in default case if none of the conidtion matches, then return this response
-        return res.status(400).json({message:'Otp is invalid or expired'})
+        // Atomic concurrency-safe failed attempt update pipeline in MongoDB bound to exact checked hash
+        const lockDurationMs = 10 * 60 * 1000;
+        const updatedOtpDoc = await Otp.findOneAndUpdate(
+            {
+                _id: isOtpExisting._id,
+                otp: isOtpExisting.otp,
+                expiresAt: { $gt: now },
+                $or: [
+                    { lockUntil: null },
+                    { lockUntil: { $lte: now } }
+                ]
+            },
+            [
+                {
+                    $set: {
+                        attempts: {
+                            $cond: {
+                                if: {
+                                    $and: [
+                                        { $ne: ["$lockUntil", null] },
+                                        { $lte: ["$lockUntil", now] }
+                                    ]
+                                },
+                                then: 1,
+                                else: { $add: [{ $ifNull: ["$attempts", 0] }, 1] }
+                            }
+                        },
+                        lockUntil: {
+                            $let: {
+                                vars: {
+                                    nextAttempts: {
+                                        $cond: {
+                                            if: {
+                                                $and: [
+                                                    { $ne: ["$lockUntil", null] },
+                                                    { $lte: ["$lockUntil", now] }
+                                                ]
+                                            },
+                                            then: 1,
+                                            else: { $add: [{ $ifNull: ["$attempts", 0] }, 1] }
+                                        }
+                                    }
+                                },
+                                in: {
+                                    $cond: {
+                                        if: { $gte: ["$$nextAttempts", 5] },
+                                        then: new Date(now.getTime() + lockDurationMs),
+                                        else: null
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            ],
+            { new: true }
+        );
 
+        if (!updatedOtpDoc) {
+            const checkLock = await Otp.findById(isOtpExisting._id);
+            if (checkLock && checkLock.lockUntil && checkLock.lockUntil > now) {
+                return res.status(400).json({ message: "Account is temporarily locked due to too many failed attempts. Try again later." });
+            }
+            return res.status(400).json({ message: "Otp is invalid or expired" });
+        }
+
+        if (updatedOtpDoc.lockUntil && updatedOtpDoc.lockUntil > now) {
+            return res.status(400).json({ message: "Too many failed attempts. Account is temporarily locked for 10 minutes." });
+        } else {
+            return res.status(400).json({ message: 'Otp is invalid or expired' });
+        }
 
     } catch (error) {
         console.log(error);
@@ -121,20 +395,62 @@ exports.verifyOtp=async(req,res)=>{
 
 exports.resendOtp=async(req,res)=>{
     try {
-
         const existingUser=await User.findById(req.body.user)
 
         if(!existingUser){
             return res.status(404).json({"message":"User not found"})
         }
 
-        await Otp.deleteMany({user:existingUser._id})
-
+        const now = new Date();
         const otp=generateOTP()
         const hashedOtp=await bcrypt.hash(otp,10)
+        const expiresAt = new Date(now.getTime() + parseInt(process.env.OTP_EXPIRATION_TIME || 120000));
 
-        const newOtp=new Otp({user:req.body.user,otp:hashedOtp,expiresAt:Date.now()+parseInt(process.env.OTP_EXPIRATION_TIME)})
-        await newOtp.save()
+        // Concurrency-safe atomic update enforcing active lock in DB
+        let updatedOtp = await Otp.findOneAndUpdate(
+            {
+                user: existingUser._id,
+                $or: [
+                    { lockUntil: null },
+                    { lockUntil: { $lte: now } }
+                ]
+            },
+            {
+                $set: {
+                    otp: hashedOtp,
+                    expiresAt: expiresAt,
+                    attempts: 0,
+                    lockUntil: null
+                }
+            },
+            { new: true }
+        );
+
+        if (!updatedOtp) {
+            const checkLock = await Otp.findOne({ user: existingUser._id });
+            if (checkLock && checkLock.lockUntil && checkLock.lockUntil > now) {
+                return res.status(400).json({ message: "Account is temporarily locked due to too many failed attempts. Try again later." });
+            }
+
+            try {
+                updatedOtp = new Otp({
+                    user: existingUser._id,
+                    otp: hashedOtp,
+                    expiresAt: expiresAt,
+                    attempts: 0,
+                    lockUntil: null
+                });
+                await updatedOtp.save();
+            } catch (err) {
+                if (err.code === 11000) {
+                    const recheck = await Otp.findOne({ user: existingUser._id });
+                    if (recheck && recheck.lockUntil && recheck.lockUntil > now) {
+                        return res.status(400).json({ message: "Account is temporarily locked due to too many failed attempts. Try again later." });
+                    }
+                }
+                throw err;
+            }
+        }
 
         await sendMail(existingUser.email,`OTP Verification for Your MERN-AUTH-REDUX-TOOLKIT Account`,`Your One-Time Password (OTP) for account verification is: <b>${otp}</b>.</br>Do not share this OTP with anyone for security reasons`)
 
@@ -190,41 +506,59 @@ exports.forgotPassword=async(req,res)=>{
 
 exports.resetPassword=async(req,res)=>{
     try {
+        const { userId, token, password } = req.body;
+        if (!token || !userId || !password) {
+            return res.status(404).json({ message: "Reset Link is Not Valid" });
+        }
+
+        // Verify JWT signature, allowed algorithm HS256, expiry, reset-password purpose, and matching userId claim
+        let decodedToken;
+        try {
+            decodedToken = jwt.verify(token, process.env.SECRET_KEY, { algorithms: ['HS256'] });
+        } catch (jwtErr) {
+            return res.status(404).json({ message: "Reset Link is Not Valid" });
+        }
+
+        if (!decodedToken || decodedToken.purpose !== 'reset-password' || String(decodedToken._id) !== String(userId)) {
+            return res.status(404).json({ message: "Reset Link is Not Valid" });
+        }
 
         // checks if user exists or not
-        const isExistingUser=await User.findById(req.body.userId)
-
-        // if user does not exists then returns a 404 response
+        const isExistingUser=await User.findById(userId)
         if(!isExistingUser){
             return res.status(404).json({message:"User does not exists"})
         }
 
         // fetches the resetPassword token by the userId
         const isResetTokenExisting=await PasswordResetToken.findOne({user:isExistingUser._id})
-
-        // If token does not exists for that userid, then returns a 404 response
         if(!isResetTokenExisting){
             return res.status(404).json({message:"Reset Link is Not Valid"})
         }
 
-        // if the token has expired then deletes the token, and send response accordingly
-        if(isResetTokenExisting.expiresAt < new Date()){
+        // if the token has expired then deletes the token
+        if(isResetTokenExisting.expiresAt <= new Date()){
             await PasswordResetToken.findByIdAndDelete(isResetTokenExisting._id)
             return res.status(404).json({message:"Reset Link has been expired"})
         }
 
-        // if token exists and is not expired and token matches the hash, then resets the user password and deletes the token
-        if(isResetTokenExisting && isResetTokenExisting.expiresAt>new Date() && (await bcrypt.compare(req.body.token,isResetTokenExisting.token))){
+        // if token exists and matches the hash
+        if(await bcrypt.compare(token, isResetTokenExisting.token)){
+            // Conditional atomic delete: consume the matching, unexpired reset record
+            const deletedResetToken = await PasswordResetToken.findOneAndDelete({
+                _id: isResetTokenExisting._id,
+                expiresAt: { $gt: new Date() }
+            });
 
-            // deleting the password reset token
-            await PasswordResetToken.findByIdAndDelete(isResetTokenExisting._id)
+            if (!deletedResetToken) {
+                return res.status(404).json({ message: "Reset Link is Not Valid" });
+            }
 
-            // resets the password after hashing it
-            await User.findByIdAndUpdate(isExistingUser._id,{password:await bcrypt.hash(req.body.password,10)})
+            // Resets the password after hashing it
+            await User.findByIdAndUpdate(isExistingUser._id,{password:await bcrypt.hash(password,10)})
             return res.status(200).json({message:"Password Updated Successfuly"})
         }
 
-        return res.status(404).json({message:"Reset Link has been expired"})
+        return res.status(404).json({message:"Reset Link is Not Valid"})
 
     } catch (error) {
         console.log(error);
@@ -234,8 +568,7 @@ exports.resetPassword=async(req,res)=>{
 
 exports.logout=async(req,res)=>{
     try {
-        res.cookie('token',{
-            maxAge:0,
+        res.clearCookie('token',{
             sameSite:process.env.PRODUCTION==='true'?"None":'Lax',
             httpOnly:true,
             secure:process.env.PRODUCTION==='true'?true:false
@@ -243,6 +576,7 @@ exports.logout=async(req,res)=>{
         res.status(200).json({message:'Logout successful'})
     } catch (error) {
         console.log(error);
+        res.status(500).json({message:'Error occured during logout'})
     }
 }
 

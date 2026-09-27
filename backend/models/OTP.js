@@ -5,7 +5,8 @@ const otpSchema=new Schema({
     user:{
         type:Schema.Types.ObjectId,
         ref:"User",
-        required:true
+        required:true,
+        unique:true
     },
     otp:{
         type:String,
@@ -15,8 +16,14 @@ const otpSchema=new Schema({
         type:Date,
         required:true
     },
+    attempts:{
+        type:Number,
+        default:0
+    },
+    lockUntil:{
+        type:Date,
+        default:null
+    }
 })
-
-
 
 module.exports=mongoose.model("OTP",otpSchema)

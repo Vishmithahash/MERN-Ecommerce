@@ -12,16 +12,16 @@ exports.verifyToken=async(req,res,next)=>{
             return res.status(401).json({message:"Token missing, please login again"})
         }
 
-        // verifies the token 
-        const decodedInfo=jwt.verify(token,process.env.SECRET_KEY)
+        // verifies the token signature, algorithm, and expiry
+        const decodedInfo=jwt.verify(token,process.env.SECRET_KEY,{ algorithms: ['HS256'] })
 
-        // checks if decoded info contains legit details, then set that info in req.user and calls next
-        if(decodedInfo && decodedInfo._id && decodedInfo.email){
+        // checks if decoded info contains legit details and login purpose
+        if(decodedInfo && decodedInfo._id && decodedInfo.email && decodedInfo.purpose === 'login'){
             req.user=decodedInfo
             next()
         }
 
-        // if token is invalid then sends the response accordingly
+        // if token is invalid or does not have login purpose then sends 401 response
         else{
             return res.status(401).json({message:"Invalid Token, please login again"})
         }

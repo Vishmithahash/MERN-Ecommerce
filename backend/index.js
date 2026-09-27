@@ -1,3 +1,6 @@
+const dns=require("dns")
+dns.setServers(["8.8.8.8","1.1.1.1"])
+
 require("dotenv").config()
 const express=require('express')
 const cors=require('cors')
@@ -19,10 +22,6 @@ const { connectToDB } = require("./database/db")
 // server init
 const server=express()
 
-// database connection
-connectToDB()
-
-
 // middlewares
 server.use(cors({origin:process.env.ORIGIN,credentials:true,exposedHeaders:['X-Total-Count'],methods:['GET','POST','PATCH','DELETE']}))
 server.use(express.json())
@@ -41,12 +40,29 @@ server.use("/address",addressRoutes)
 server.use("/reviews",reviewRoutes)
 server.use("/wishlist",wishlistRoutes)
 
-
-
 server.get("/",(req,res)=>{
     res.status(200).json({message:'running'})
 })
 
-server.listen(8000,()=>{
-    console.log('server [STARTED] ~ http://localhost:8000');
-})
+const PORT = process.env.PORT || 5000
+
+const startServer = async () => {
+    const requiredEnvVars = ['MONGO_URI', 'SECRET_KEY', 'GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_CALLBACK_URL', 'ORIGIN', 'FRONTEND_URL'];
+    const invalidVars = requiredEnvVars.filter(v => !process.env[v] || process.env[v].includes('REPLACE_WITH_'));
+    if (invalidVars.length > 0) {
+        console.error(`[Startup Error] Missing or unconfigured environment variables: ${invalidVars.join(', ')}`);
+        process.exit(1);
+    }
+
+    try {
+        await connectToDB();
+        server.listen(PORT, () => {
+            console.log(`server [STARTED] ~ http://localhost:${PORT}`);
+        });
+    } catch (error) {
+        console.error(`[Startup Error] Could not start server: ${error.message}`);
+        process.exit(1);
+    }
+};
+
+startServer();
