@@ -1,12 +1,16 @@
 const Review=require("../models/Review")
+const { isObjectIdOrHexString } = require('mongoose')
 
 exports.create=async(req,res)=>{
     try {
-        console.log(req.body);
-        const created=await new Review(req.body).populate({path:'user',select:"-password"})
+        const {product,rating,comment}=req.body
+        const created=await new Review({product,rating,comment,user:req.user._id}).populate({path:'user',select:"-password"})
         await created.save()
         res.status(201).json(created)
     } catch (error) {
+        if(error.name==='ValidationError' || error.name==='CastError'){
+            return res.status(400).json({message:'Invalid review data'})
+        }
         console.log(error);
         return res.status(500).json({message:'Error posting review, please trying again later'})
     }
@@ -41,9 +45,34 @@ exports.getByProductId=async(req,res)=>{
 exports.updateById=async(req,res)=>{
     try {
         const {id}=req.params
-        const updated=await Review.findByIdAndUpdate(id,req.body,{new:true}).populate('user')
+        if(!isObjectIdOrHexString(id)){
+            return res.status(400).json({message:'Invalid review ID'})
+        }
+
+        const changes={}
+        for(const field of ['rating','comment']){
+            if(Object.prototype.hasOwnProperty.call(req.body,field)){
+                changes[field]=req.body[field]
+            }
+        }
+        if(Object.keys(changes).length===0){
+            return res.status(400).json({message:'Provide a rating or comment to update'})
+        }
+
+        const filter={_id:id}
+        if(!req.user.isAdmin){
+            filter.user=req.user._id
+        }
+
+        const updated=await Review.findOneAndUpdate(filter,{$set:changes},{new:true,runValidators:true}).populate('user')
+        if(!updated){
+            return res.status(404).json({message:'Review not found or not accessible'})
+        }
         res.status(200).json(updated)
     } catch (error) {
+        if(error.name==='ValidationError' || error.name==='CastError'){
+            return res.status(400).json({message:'Invalid review data'})
+        }
         console.log(error);
         res.status(500).json({message:'Error updating review, please try again later'})
     }
@@ -52,7 +81,19 @@ exports.updateById=async(req,res)=>{
 exports.deleteById=async(req,res)=>{
     try {
         const {id}=req.params
-        const deleted=await Review.findByIdAndDelete(id)
+        if(!isObjectIdOrHexString(id)){
+            return res.status(400).json({message:'Invalid review ID'})
+        }
+
+        const filter={_id:id}
+        if(!req.user.isAdmin){
+            filter.user=req.user._id
+        }
+
+        const deleted=await Review.findOneAndDelete(filter)
+        if(!deleted){
+            return res.status(404).json({message:'Review not found or not accessible'})
+        }
         res.status(200).json(deleted)
     } catch (error) {
         console.log(error);
