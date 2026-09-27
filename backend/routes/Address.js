@@ -1,11 +1,12 @@
 const express=require('express')
 const addressController=require("../controllers/Address")
+const { verifyToken } = require('../middleware/VerifyToken')
 const router=express.Router()
 
 router
-    .post("/",addressController.create)
-    .get("/user/:id",addressController.getByUserId)
-    .patch('/:id',addressController.updateById)
-    .delete('/:id',addressController.deleteById)
+    .post("/",verifyToken,addressController.create)
+    .get("/user/:id",verifyToken,addressController.getByUserId)
+    .patch('/:id',verifyToken,addressController.updateById)
+    .delete('/:id',verifyToken,addressController.deleteById)
 
 module.exports=router
