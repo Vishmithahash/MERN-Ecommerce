@@ -23,6 +23,10 @@ const otpSchema=new Schema({
     lockUntil:{
         type:Date,
         default:null
+    },
+    lastResendAt:{
+        type:Date,
+        default:null
     }
 })
 

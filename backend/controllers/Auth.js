@@ -406,21 +406,39 @@ exports.resendOtp=async(req,res)=>{
         const hashedOtp=await bcrypt.hash(otp,10)
         const expiresAt = new Date(now.getTime() + parseInt(process.env.OTP_EXPIRATION_TIME || 120000));
 
-        // Concurrency-safe atomic update enforcing active lock in DB
+        const resendCooldownMs = parseInt(process.env.RESEND_COOLDOWN_MS || "30000"); // 30 second resend cooldown
+        const minLastResend = new Date(now.getTime() - resendCooldownMs);
+
+        // Check active lock or cooldown before updating
+        const checkDoc = await Otp.findOne({ user: existingUser._id });
+        if (checkDoc) {
+            if (checkDoc.lockUntil && checkDoc.lockUntil > now) {
+                return res.status(400).json({ message: "Account is temporarily locked due to too many failed attempts. Try again later." });
+            }
+            if (checkDoc.lastResendAt && checkDoc.lastResendAt > minLastResend) {
+                const waitSec = Math.ceil((checkDoc.lastResendAt.getTime() + resendCooldownMs - now.getTime()) / 1000);
+                return res.status(429).json({ message: `Please wait ${waitSec} seconds before requesting another OTP.` });
+            }
+        }
+
+        // Concurrency-safe atomic update enforcing active lock and cooldown in DB
         let updatedOtp = await Otp.findOneAndUpdate(
             {
                 user: existingUser._id,
                 $or: [
                     { lockUntil: null },
                     { lockUntil: { $lte: now } }
+                ],
+                $or: [
+                    { lastResendAt: null },
+                    { lastResendAt: { $lte: minLastResend } }
                 ]
             },
             {
                 $set: {
                     otp: hashedOtp,
                     expiresAt: expiresAt,
-                    attempts: 0,
-                    lockUntil: null
+                    lastResendAt: now
                 }
             },
             { new: true }
@@ -428,8 +446,13 @@ exports.resendOtp=async(req,res)=>{
 
         if (!updatedOtp) {
             const checkLock = await Otp.findOne({ user: existingUser._id });
-            if (checkLock && checkLock.lockUntil && checkLock.lockUntil > now) {
-                return res.status(400).json({ message: "Account is temporarily locked due to too many failed attempts. Try again later." });
+            if (checkLock) {
+                if (checkLock.lockUntil && checkLock.lockUntil > now) {
+                    return res.status(400).json({ message: "Account is temporarily locked due to too many failed attempts. Try again later." });
+                }
+                if (checkLock.lastResendAt && checkLock.lastResendAt > minLastResend) {
+                    return res.status(429).json({ message: "Please wait before requesting another OTP." });
+                }
             }
 
             try {
@@ -438,14 +461,20 @@ exports.resendOtp=async(req,res)=>{
                     otp: hashedOtp,
                     expiresAt: expiresAt,
                     attempts: 0,
-                    lockUntil: null
+                    lockUntil: null,
+                    lastResendAt: now
                 });
                 await updatedOtp.save();
             } catch (err) {
                 if (err.code === 11000) {
                     const recheck = await Otp.findOne({ user: existingUser._id });
-                    if (recheck && recheck.lockUntil && recheck.lockUntil > now) {
-                        return res.status(400).json({ message: "Account is temporarily locked due to too many failed attempts. Try again later." });
+                    if (recheck) {
+                        if (recheck.lockUntil && recheck.lockUntil > now) {
+                            return res.status(400).json({ message: "Account is temporarily locked due to too many failed attempts. Try again later." });
+                        }
+                        if (recheck.lastResendAt && recheck.lastResendAt > minLastResend) {
+                            return res.status(429).json({ message: "Please wait before requesting another OTP." });
+                        }
                     }
                 }
                 throw err;
